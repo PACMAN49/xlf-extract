@@ -1,10 +1,87 @@
 #!/usr/bin/env node
 'use strict';
 
+// Fix on https://github.com/tsvetomir/xlf-extract to...
+// -> support ID fields directly on a trans-unit 'id' attribute instead of trans-unit.node.meaning (ex: ng-bootstrap i18n)
+// -> support description generated from id and source instead of missing trans-unit.node.description
+// See: https://github.com/tsvetomir/xlf-extract/issues/5
+
 const fs = require('fs');
 const cheerio = require('cheerio');
-const extract = require('../index');
-const formatYaml = require('../src/format-yaml');
+/**
+ * Extracts translations from XLIFF files.
+ *
+ * @param doc object an XLIFF document parsed with cheerio
+ * @param useTarget boolean a flag indicating if the target field should be extracted instead of source
+ * @return object a tree of keys and their source messages and descriptions
+ */
+const extract = (doc, useTarget) => {
+  const units = doc('trans-unit').toArray();
+  // const hasNotes = unit => doc(unit).find('note').length > 0; // This filtering is problematic and bypass valid entries instead of handling them
+  const noteField = (unit, field) =>
+    doc(unit).find(`note[from=${ field }]`).text();
+  const description = unit => noteField(unit, 'description') || `${meaning(unit)} ${source(unit)}`; // Fix to build a description for ng-bootstrap trans-unit format
+  const meaning = unit => noteField(unit, 'meaning') || unit.attribs['id']; // Fix for ng-bootstrap trans-unit format
+  const sourceField = useTarget ? 'target' : 'source';
+  const source = unit => doc(unit).find(sourceField).html().toString().replace('#', '&#35;'); // Support for number signs, which conflict with yaml comments
+
+  return units
+      // .filter(hasNotes) // This filtering is problematic and bypass valid entries instead of handling them
+      .map(unit => ({
+          description: description(unit),
+          id: meaning(unit),
+          source: source(unit)
+      }))
+      .filter(d => isKey(d.id));
+};
+
+const isKey = val => !!val.match(/^[^.\s]*\.\S*$/);
+
+const idParts = unit => unit.id.split('.');
+const leaf = Symbol();
+
+// Expands unit keys into nested objects
+const expand = units => units.reduce((dict, unit) => {
+    const unitRoot = idParts(unit).reduce((root, part) =>
+        root[part] ? root[part] : root[part] = {},
+    dict);
+
+    unitRoot[leaf] = unit;
+
+    return dict;
+}, {});
+
+const indent = depth => depth == 0 ? '' : '  ' + indent(depth - 1);
+
+const last = arr => arr[arr.length - 1];
+
+const source = unit => last(idParts(unit)) + ': ' + unit.source;
+
+const comment = unit => unit.description ?
+    `# ${unit.description}` : null;
+
+const formatLine = (unit, depth) =>
+    [comment(unit), source(unit)]
+    .filter(line => line)
+    .map(line => indent(depth) + line)
+    .join('\n') + '\n';
+
+const formatKey = (root, key, depth) =>
+    indent(depth) + key + ':\n' + format(root[key], depth + 1);
+
+const format = (root, depth) =>
+    Object.keys(root).map(key =>
+        root[key][leaf] ?
+            formatLine(root[key][leaf], depth) :
+            formatKey(root, key, depth)
+        )
+        .join('\n');
+
+const formatYaml = units => {
+    const sorted = units.sort((a, b) => a.id.localeCompare(b.id));
+    const expanded = expand(sorted);
+    return format(expanded, 0);
+};
 
 const args = (() => {
     const argparse = require('argparse');
